@@ -1,0 +1,810 @@
+# =============================================================================
+# AI Media Factory — Production docker-compose.yml
+# Compose Specification v3.8+ | docker compose config —test compliant
+# =============================================================================
+#
+# Purpose:  Self-hosted AI platform (n8n, PostgreSQL 17, Redis 8, MinIO,
+#           Qdrant, Ollama, Nginx reverse proxy) — portable across GCP, AWS,
+#           Azure, Oracle Cloud, DigitalOcean, Hetzner, Contabo, and local
+#           Docker without architectural changes.
+#
+# Usage:
+#   docker compose up -d                      # Start all services
+#   docker compose --profile monitoring up -d # Start with monitoring extras
+#   docker compose -f docker-compose.yml --env-file .env config  # Validate
+#
+# ──────────────────────────────────────────────────────────────────────────────
+# NOTES
+# ──────────────────────────────────────────────────────────────────────────────
+# • All passwords / secrets must be injected via Docker secrets or environment
+#   files — never committed to version control.
+# • .env file example is provided in .env.example alongside this file.
+# • All volumes use named volumes declared in the top-level `volumes:` block
+#   for Docker-managed persistence and backup portability.
+# • Service healthchecks use interval + retries to avoid flapping on cold start.
+# • Ollama GPU support requires NVIDIA Container Toolkit on the host.
+# =============================================================================
+
+name: ai-media-factory
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Compose Specification header
+# ──────────────────────────────────────────────────────────────────────────────
+services:
+
+  # ════════════════════════════════════════════════════════════════════════
+  # Nginx Reverse Proxy
+  # ════════════════════════════════════════════════════════════════════════
+  nginx:
+    image: nginxinc/nginx-unprivileged:1.26-alpine
+    container_name: ai-media-factory-nginx
+    restart: unless-stopped
+    privileged: false
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+      - /var/cache/nginx:size=32m
+      - /var/run:size=8m
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+    sysctls:
+      net.core.somaxconn: 4096
+      net.ipv4.tcp_max_syn_backlog: 8192
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv4.ip_local_port_range: 1024 65535
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      nproc:
+        soft: 4096
+        hard: 4096
+    ports:
+      - target: 80
+        published: 80
+        protocol: tcp
+        mode: host
+      - target: 443
+        published: 443
+        protocol: tcp
+        mode: host
+    volumes:
+      - nginx_conf:/etc/nginx/conf.d:ro
+      - nginx_certs:/etc/nginx/certs:ro
+      - nginx_ssl:/etc/nginx/ssl:ro
+      - nginx_logs:/var/log/nginx
+      - nginx_static:/usr/share/nginx/html:ro
+    environment:
+      TZ: ${TZ:-UTC}
+      NGINX_HOST: ${NGINX_HOST:-ai-media-factory.local}
+      NGINX_PORT_HTTP: 80
+      NGINX_PORT_HTTPS: 443
+    networks:
+      - frontend
+      - backend
+    depends_on:
+      n8n:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+        compress: "true"
+
+  # ════════════════════════════════════════════════════════════════════════
+  # n8n — Workflow Automation Engine
+  # ════════════════════════════════════════════════════════════════════════
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: ai-media-factory-n8n
+    restart: unless-stopped
+    privileged: false
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+      - /home/node/.cache:size=128m
+      - /tmp/n8n_db:size=64m
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - SETFCAP
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+    sysctls:
+      net.core.somaxconn: 4096
+      net.ipv4.tcp_max_syn_backlog: 8192
+      net.ipv4.tcp_tw_reuse: 1
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      nproc:
+        soft: 4096
+        hard: 4096
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - n8n_logs:/home/node/.n8n/logs
+    environment:
+      TZ: ${TZ:-UTC}
+      N8N_HOST: ${N8N_HOST:-n8n.ai-media-factory.local}
+      N8N_PORT: 5678
+      N8N_PROTOCOL: https
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_USER:-admin}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_PASSWORD}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB:-n8n}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER:-n8n}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_POSTGRESDB_SSL: "false"
+      GENERIC_TIMEZONE: ${TZ:-UTC}
+      WEBHOOK_URL: https://${N8N_HOST:-n8n.ai-media-factory.local}/
+      EXECUTIONS_TIMEOUT: 3600
+      MAX_FUNCTION_CALLS: 1000
+      QUEUE_BULL_BOARD_ACTIVE: "true"
+      N8N_RUNNERS_ENABLED: "true"
+      NODE_FUNCTION_ALLOW_EXTERNAL: "true"
+    networks:
+      - backend
+      - database
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:5678/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+        compress: "true"
+
+  # ════════════════════════════════════════════════════════════════════════
+  # PostgreSQL 17 — Primary Relational Database
+  # ════════════════════════════════════════════════════════════════════════
+  postgres:
+    image: postgres:17-bookworm
+    container_name: ai-media-factory-postgres
+    restart: unless-stopped
+    privileged: false
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+      - /run/postgresql:size=16m
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETFCAP
+    security_opt:
+      - no-new-privileges:true
+    sysctls:
+      net.core.somaxconn: 4096
+      net.ipv4.tcp_max_syn_backlog: 8192
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      nproc:
+        soft: 4096
+        hard: 4096
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - pg_config:/etc/postgresql:ro
+      - pg_init:/docker-entrypoint-initdb.d:ro
+    environment:
+      TZ: ${TZ:-UTC}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-ai_media_factory}
+      PGDATA: /var/lib/postgresql/data/pgdata
+      PGLOG_DIR: /var/log/postgresql
+      LANG: en_US.UTF-8
+      LC_ALL: en_US.UTF-8
+      PostgreSQL_TIMEZONE: ${TZ:-UTC}
+      MAX_CONNECTIONS: 200
+      SHARED_BUFFERS: 256MB
+      EFFECTIVE_CACHE_SIZE: 1GB
+      WORK_MEM: 16MB
+      MAINTENANCE_WORK_MEM: 128MB
+      WAL_LEVEL: replica
+      MAX_WAL_SIZE: 1GB
+      MIN_WAL_SIZE: 80MB
+      CHECKPOINT_COMPLETION_TARGET: 0.9
+      LOG_STATEMENT: all
+      LOG_LINE_PREFIX: "%t [%p]: "
+      LOG_TIMEZONE: ${TZ:-UTC}
+      AUTO_VACUUM: "on"
+      AUTOVACUUM_MAX_WORKERS: 3
+      AUTOVACUUM_NAPILIMIT: 50
+    networks:
+      - database
+    depends_on: {}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-ai_media_factory} -q"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+        compress: "true"
+
+  # ════════════════════════════════════════════════════════════════════════
+  # Redis 8 — Cache & Message Broker (n8n queue)
+  # ════════════════════════════════════════════════════════════════════════
+  redis:
+    image: redis:8-bookworm
+    container_name: ai-media-factory-redis
+    restart: unless-stopped
+    privileged: false
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+      - /tmp/redis:size=32m
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+      - SETFCAP
+    security_opt:
+      - no-new-privileges:true
+    sysctls:
+      net.core.somaxconn: 4096
+      net.ipv4.tcp_max_syn_backlog: 8192
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      nproc:
+        soft: 4096
+        hard: 4096
+    volumes:
+      - redis_data:/data
+      - redis_logs:/var/log/redis
+    entrypoint:
+      - sh
+      - -c
+      - |
+        exec redis-server \
+          --requirepass "${REDIS_PASSWORD}" \
+          --bind 0.0.0.0 \
+          --port 6379 \
+          --maxmemory "${REDIS_MAXMEMORY:-2gb}" \
+          --maxmemory-policy allkeys-lru \
+          --save 900 1 \
+          --save 300 10 \
+          --save 60 10000 \
+          --appendonly yes \
+          --appendfilename "appendonly.aof" \
+          --appendfsync everysec \
+          --logfile /var/log/redis/redis.log \
+          --loglevel notice \
+          --syslog-enabled no \
+          --daemonize no
+    environment:
+      TZ: ${TZ:-UTC}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      REDIS_MAXMEMORY: ${REDIS_MAXMEMORY:-2gb}
+    networks:
+      - database
+      - backend
+    depends_on: {}
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+        compress: "true"
+
+  # ════════════════════════════════════════════════════════════════════════
+  # MinIO — S3-Compatible Object Storage
+  # ════════════════════════════════════════════════════════════════════════
+  minio:
+    image: minio/minio:latest
+    container_name: ai-media-factory-minio
+    restart: unless-stopped
+    privileged: false
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m
+      - /tmp/minio-data:size=4g
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETFCAP
+    security_opt:
+      - no-new-privileges:true
+    sysctls:
+      net.core.somaxconn: 4096
+      net.ipv4.tcp_max_syn_backlog: 8192
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      nproc:
+        soft: 4096
+        hard: 4096
+    volumes:
+      - minio_data:/data
+      - minio_config:/root/.minio
+      - minio_logs:/var/log/minio
+    entrypoint:
+      - sh
+      - -c
+      - |
+        exec minio server /data \
+          --address ":9000" \
+          --console-address ":9001" \
+          --config-dir /root/.minio
+    environment:
+      TZ: ${TZ:-UTC}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_DOMAIN: ${MINIO_DOMAIN:-minio.ai-media-factory.local}
+      MINIO_STORAGE_CLASS: STANDARD
+      MINIO_CACHE_DRIVES: ""
+      MINIO_CACHE_EXCLUDE: "*.tmp,*.log"
+      MINIO_COMPUTE_NODES: "1"
+      MINIO_UPDATE: "off"
+    networks:
+      - storage
+      - backend
+    depends_on: {}
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+        compress: "true"
+
+  # ════════════════════════════════════════════════════════════════════════
+  # Qdrant — Vector Database for AI Embeddings
+  # ════════════════════════════════════════════════════════════════════════
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: ai-media-factory-qdrant
+    restart: unless-stopped
+    privileged: false
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m
+      - /qdrant/tmp:size=1g
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETFCAP
+    security_opt:
+      - no-new-privileges:true
+    sysctls:
+      net.core.somaxconn: 4096
+      net.ipv4.tcp_max_syn_backlog: 8192
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      nproc:
+        soft: 4096
+        hard: 4096
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - qdrant_data:/qdrant/storage
+      - qdrant_snapshots:/qdrant/snapshots
+      - qdrant_config:/qdrant/config:ro
+      - qdrant_logs:/var/log/qdrant
+    environment:
+      TZ: ${TZ:-UTC}
+      QDRANT__SERVICE__GRPC_PORT: 6334
+      QDRANT__SERVICE__HTTP_PORT: 6333
+      QDRANT__SERVICE__ALLOW_CORS: "true"
+      QDRANT__STORAGE__WAL_PATH: "/qdrant/storage/wal"
+      QDRANT__STORAGE__SNAPSHOT_PATH: "/qdrant/snapshots"
+      QDRANT__STORAGE__PATH: "/qdrant/storage"
+      QDRANT__STORAGE__MAX_WAL_SIZE: "4294967296"
+      QDRANT__STORAGE__WAL_MEMORY_MMAP_SIZE_THRESHOLD: "1073741824"
+      QDRANT__STORAGE__SNAPSHOT_INTERVAL: "300"
+      QDRANT__STORAGE__PERFORMANCE_WARNING_THRESHOLD: "5000"
+      QDRANT__COLLECTIONS__MAX_COLLECTIONS: "1000"
+      QDRANT__OPENVISOR__ENABLED: "true"
+      QDRANT__LOG_LEVEL: "info"
+      QDRANT__LOG_JSON: "true"
+      QDRANT__LOG_FILE_ENABLE: "true"
+      QDRANT__LOG_FILE_PATH: "/var/log/qdrant/qdrant.log"
+      QDRANT__TELEMETRY__ENABLED: "false"
+      QDRANT__CLUSTER__ENABLED: "false"
+      QDRANT__MEMORY__ALLOCATOR: "jemalloc"
+    networks:
+      - ai
+      - backend
+    depends_on: {}
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+        compress: "true"
+
+  # ════════════════════════════════════════════════════════════════════════
+  # Ollama — Local LLM Runtime
+  # ════════════════════════════════════════════════════════════════════════
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ai-media-factory-ollama
+    restart: unless-stopped
+    privileged: true
+    read_only: false
+    tmpfs:
+      - /tmp:size=2g
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETFCAP
+      - SYS_ADMIN
+      - SYS_RESOURCE
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:false
+    sysctls:
+      net.core.somaxconn: 4096
+      net.ipv4.tcp_max_syn_backlog: 8192
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      nproc:
+        soft: 4096
+        hard: 4096
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - ollama_models:/root/.ollama/models
+      - ollama_data:/root/.ollama
+      - ollama_cache:/root/.cache/ollama
+      - ollama_logs:/var/log/ollama
+    environment:
+      TZ: ${TZ:-UTC}
+      OLLAMA_HOST: 0.0.0.0:11434
+      OLLAMA_ORIGINS: ${OLLAMA_ORIGINS:-https://ai-media-factory.local}
+      OLLAMA_MODELS: /root/.ollama/models
+      OLLAMA_KEEP_ALIVE: 5m
+      OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL:-1}
+      OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-2}
+      OLLAMA_GPU_LAYERS: ${OLLAMA_GPU_LAYERS:-1}
+      OLLAMA_VULKAN: "1"
+      OLLAMA_FLASH_ATTENTION: "1"
+      OLLAMA_API_KEY: ${OLLAMA_API_KEY}
+    ports:
+      - target: 11434
+        published: 11434
+        protocol: tcp
+        mode: host
+    networks:
+      - ai
+      - backend
+    depends_on: {}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'ollama list >/dev/null 2>&1'
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+        compress: "true"
+      # GPU support requires NVIDIA Container Toolkit on the host
+      # Uncomment the following if NVIDIA Container Toolkit is installed:
+      # runtime: nvidia
+      # devices:
+      #   - "/dev/dri:/dev/dri"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Named Volumes
+# ──────────────────────────────────────────────────────────────────────────────
+volumes:
+  # n8n
+  n8n_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${AI_MEDIA_FACTORY_VOLUME_BASE:-/opt/ai-media-factory}/n8n/data
+    name: ai-media-factory-n8n_data
+  n8n_logs:
+    driver: local
+    name: ai-media-factory-n8n_logs
+
+  # PostgreSQL
+  pg_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${AI_MEDIA_FACTORY_VOLUME_BASE:-/opt/ai-media-factory}/postgres/data
+    name: ai-media-factory-pg_data
+  pg_config:
+    driver: local
+    name: ai-media-factory-pg_config
+  pg_init:
+    driver: local
+    name: ai-media-factory-pg_init
+
+  # Redis
+  redis_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${AI_MEDIA_FACTORY_VOLUME_BASE:-/opt/ai-media-factory}/redis/data
+    name: ai-media-factory-redis_data
+  redis_config:
+    driver: local
+    name: ai-media-factory-redis_config
+  redis_logs:
+    driver: local
+    name: ai-media-factory-redis_logs
+
+  # MinIO
+  minio_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${AI_MEDIA_FACTORY_VOLUME_BASE:-/opt/ai-media-factory}/minio/data
+    name: ai-media-factory-minio_data
+  minio_config:
+    driver: local
+    name: ai-media-factory-minio_config
+  minio_logs:
+    driver: local
+    name: ai-media-factory-minio_logs
+
+  # Qdrant
+  qdrant_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${AI_MEDIA_FACTORY_VOLUME_BASE:-/opt/ai-media-factory}/qdrant/data
+    name: ai-media-factory-qdrant_data
+  qdrant_snapshots:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${AI_MEDIA_FACTORY_VOLUME_BASE:-/opt/ai-media-factory}/qdrant/snapshots
+    name: ai-media-factory-qdrant_snapshots
+  qdrant_config:
+    driver: local
+    name: ai-media-factory-qdrant_config
+  qdrant_logs:
+    driver: local
+    name: ai-media-factory-qdrant_logs
+
+  # Ollama
+  ollama_models:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${AI_MEDIA_FACTORY_VOLUME_BASE:-/opt/ai-media-factory}/ollama/models
+    name: ai-media-factory-ollama_models
+  ollama_data:
+    driver: local
+    name: ai-media-factory-ollama_data
+  ollama_cache:
+    driver: local
+    name: ai-media-factory-ollama_cache
+  ollama_logs:
+    driver: local
+    name: ai-media-factory-ollama_logs
+
+  # Nginx
+  nginx_conf:
+    driver: local
+    name: ai-media-factory-nginx_conf
+  nginx_certs:
+    driver: local
+    name: ai-media-factory-nginx_certs
+  nginx_ssl:
+    driver: local
+    name: ai-media-factory-nginx_ssl
+  nginx_logs:
+    driver: local
+    name: ai-media-factory-nginx_logs
+  nginx_static:
+    driver: local
+    name: ai-media-factory-nginx_static
+
+  # Monitoring (profile-based)
+  prometheus_config:
+    driver: local
+    name: ai-media-factory-prometheus_config
+  prometheus_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${AI_MEDIA_FACTORY_VOLUME_BASE:-/opt/ai-media-factory}/prometheus/data
+    name: ai-media-factory-prometheus_data
+  prometheus_rules:
+    driver: local
+    name: ai-media-factory-prometheus_rules
+  grafana_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${AI_MEDIA_FACTORY_VOLUME_BASE:-/opt/ai-media-factory}/grafana/data
+    name: ai-media-factory-grafana_data
+  grafana_config:
+    driver: local
+    name: ai-media-factory-grafana_config
+  grafana_plugins:
+    driver: local
+    name: ai-media-factory-grafana_plugins
+  grafana_logs:
+    driver: local
+    name: ai-media-factory-grafana_logs
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Networks
+# ──────────────────────────────────────────────────────────────────────────────
+networks:
+  frontend:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "true"
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.20.0.0/16
+          gateway: 172.20.0.1
+    name: ai-media-factory-frontend
+
+  backend:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "true"
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.21.0.0/16
+          gateway: 172.21.0.1
+    name: ai-media-factory-backend
+
+  database:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "true"
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.22.0.0/16
+          gateway: 172.22.0.1
+    name: ai-media-factory-database
+
+  storage:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "true"
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.23.0.0/16
+          gateway: 172.23.0.1
+    name: ai-media-factory-storage
+
+  ai:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "true"
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.24.0.0/16
+          gateway: 172.24.0.1
+    name: ai-media-factory-ai
+
+  management:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "true"
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.25.0.0/16
+          gateway: 172.25.0.1
+    name: ai-media-factory-management
+
+
+
