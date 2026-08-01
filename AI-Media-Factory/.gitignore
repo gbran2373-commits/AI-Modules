@@ -4,6 +4,8 @@ secrets/
 
 backups/
 
+backups/docker-compose/
+
 logs/
 
 data/
@@ -27,3 +29,4 @@ n8n/
 *.sqlite
 
 *.sqlite3  
+
